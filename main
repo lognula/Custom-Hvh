@@ -1,0 +1,618 @@
+-- penablox RECODE
+-- Koch bratan
+local hitSoundId = "rbxassetid://111902710547432"
+local tab = menu.new_tab("Custom HvH", "rbxassetid://10734975692")
+
+local function setupAntiAim(section)
+    local enabled = section:new_toggle("Enable Custom Anti-Aim", true)
+    local pitch = section:new_combobox("Pitch", { "Down", "Zero", "Up" }, "Down")
+    local standing = section:new_slider("Standing jitter", 0, 90, 55, 0, " deg")
+    local moving = section:new_slider("Moving jitter", 0, 90, 35, 0, " deg")
+    local airborne = section:new_slider("Airborne jitter", 0, 90, 45, 0, " deg")
+    local desync = section:new_slider("Desync limit", 0, 86, 58, 0, " deg")
+    local reactToDamage = section:new_toggle("Switch side on damage", true)
+
+    local crouching = section:new_slider("Crouching jitter", 0, 90, 42, 0, " deg")
+    local standingProfile = { amplitude = standing, steps = { -1, -0.48, 0.48, 1 }, minTicks = 3, maxTicks = 5 }
+    local movingProfile = { amplitude = moving, steps = { -1, 0, 1 }, minTicks = 2, maxTicks = 3 }
+    local airProfile = { amplitude = airborne, steps = { -1, -0.35, 0.7, 1 }, minTicks = 2, maxTicks = 4 }
+    local crouchProfile = { amplitude = crouching, steps = { -1, -0.2, 0.65 }, minTicks = 3, maxTicks = 6 }
+    local stepIndex = 0
+    local nextSwitch
+    local previousProfile
+    local yawOffset = 0
+    local inverted = false
+    local active = false
+    local lastHealth
+    local holdSideUntil = 0
+
+    local running
+    local transitionSince
+
+    local function groundProfile(info)
+        local speed = info.speed
+        local movingNow = info.state == "Run"
+        if type(speed) == "number" then
+            local threshold = running and 1.5 or 2.5
+            movingNow = speed > threshold
+        end
+        if running == nil or movingNow == running then
+            running = movingNow
+            transitionSince = nil
+        else
+            local now = globals.realtime()
+            transitionSince = transitionSince or now
+            if now - transitionSince >= 0.08 then
+                running = movingNow
+                transitionSince = nil
+            end
+        end
+        return running and movingProfile or standingProfile
+    end
+
+    local function yawModifier()
+        return yawOffset
+    end
+
+    local function release()
+        if not active then return end
+
+        local manual = aa.get_manual and aa.get_manual()
+        aa.reset()
+        if manual and aa.set_manual and aa.get_manual() ~= manual then
+            aa.set_manual(manual)
+        end
+
+        running, transitionSince = nil, nil
+        lastHealth, holdSideUntil = nil, 0
+        active = false
+        nextSwitch = nil
+        previousProfile = nil
+        stepIndex = 0
+    end
+
+    local function update(tick)
+        if not enabled:get() or (aa.is_manual and aa.is_manual()) then
+            release()
+            return
+        end
+
+        local player = entity.get_local_player()
+        local info = player and entity.get_info(player)
+        if not info or not info.is_alive then
+            release()
+            return
+        end
+
+        local profile = standingProfile
+        if info.is_in_air or info.state == "Jumping" then
+            profile = airProfile
+        elseif info.is_crouching or info.state == "Duck" then
+            profile = crouchProfile
+        else
+            profile = groundProfile(info)
+        end
+        if profile == airProfile or profile == crouchProfile then
+            running, transitionSince = nil, nil
+        end
+
+        if type(tick) ~= "number" then
+            tick = globals.tickcount()
+        end
+
+        local steps = profile.steps
+        local now = globals.realtime()
+        local health = info.health
+        local damaged = type(health) == "number" and lastHealth ~= nil and health < lastHealth
+        lastHealth = type(health) == "number" and health or nil
+        if not reactToDamage:get() then holdSideUntil = 0 end
+
+        if damaged and reactToDamage:get() and now >= holdSideUntil then
+            -- Start on the far end opposite the previous yaw. Every profile
+            -- orders its steps from left to right.
+            stepIndex = yawOffset >= 0 and 1 or #steps
+            inverted = not inverted
+            holdSideUntil = now + math.random(20, 35) / 100
+            nextSwitch = tick + profile.minTicks
+            previousProfile = profile
+        elseif not nextSwitch or tick >= nextSwitch or nextSwitch - tick > profile.maxTicks or profile ~= previousProfile then
+            if profile ~= previousProfile or stepIndex == 0 then
+                stepIndex = math.random(1, #steps)
+            else
+                local choice = math.random(1, #steps - 1)
+                stepIndex = choice < stepIndex and choice or choice + 1
+            end
+            if now >= holdSideUntil then inverted = math.random(0, 1) == 1 end
+            nextSwitch = tick + math.random(profile.minTicks, profile.maxTicks)
+            previousProfile = profile
+        end
+
+        yawOffset = steps[stepIndex] * profile.amplitude:get()
+        local limit = desync:get()
+        active = true
+        aa.override_pitch(pitch:get())
+        aa.override_yaw(180, "camera")
+        aa.override_yaw_modifier(yawModifier)
+        aa.override_body_yaw(limit > 0)
+        if limit > 0 then
+            aa.override_desync_limits(limit, limit)
+            aa.override_inverter(inverted)
+        end
+    end
+
+    return update, release
+end
+
+local function setupResolver(section)
+    local enabled = section:new_toggle("Enable adaptive yaw", true)
+
+    local offsets = { 58, -58, 0, 86, -86, 29, -29 }
+    local players = {}
+    local targets = {}
+    local targetsByUserId = {}
+    local shots = {}
+    local bursts = {}
+    local lastDecision = "No completed shots yet."
+    section:new_button("Explain last burst", function()
+        print("[Resolver] " .. lastDecision)
+        notify("Resolver", lastDecision, 5, false)
+    end)
+    local active = false
+
+    local function restorePlayer(state)
+        if state.originalForce == nil and state.originalOffset == nil then return end
+
+        plist.set(state.player, "Override yaw offset", state.originalOffset or 0)
+        plist.set(state.player, "Force body yaw", state.originalForce == true)
+        state.originalForce = nil
+        state.originalOffset = nil
+    end
+
+    local function stop()
+        if not active then return end
+        for _, state in pairs(players) do
+            restorePlayer(state)
+        end
+        players = {}
+        targets = {}
+        targetsByUserId = {}
+        shots = {}
+        bursts = {}
+        lastDecision = "No completed shots yet."
+        active = false
+    end
+
+    -- One half-life is 12 seconds of game time. Evidence from late callbacks
+    -- is weighted by when the shot was fired.
+    local function recentScore(stance, index, now)
+        local entry = stance.scores[index]
+        if not entry then return 0 end
+        return entry.value * 0.5 ^ (math.max(0, now - entry.time) / 12)
+    end
+
+    local function measuredDelta(enemy)
+        if not entity.get_player_lby_deg or not entity.get_player_angles_deg then return nil end
+        local _, eye = entity.get_player_angles_deg(enemy)
+        local feet = entity.get_player_lby_deg(enemy)
+        if type(eye) ~= "number" or type(feet) ~= "number" then return nil end
+        return (feet - eye + 180) % 360 - 180
+    end
+
+    local function nearestAngle(delta)
+        local best = 3
+        for index, angle in ipairs(offsets) do
+            if math.abs(angle - delta) < math.abs(offsets[best] - delta) then best = index end
+        end
+        return best
+    end
+
+    local function selectAlternative(stance, now)
+        local bestIndex
+        local bestScore
+
+        for step = 1, #offsets - 1 do
+            local index = (stance.index - 1 + step) % #offsets + 1
+            local score = recentScore(stance, index, now)
+            if bestScore == nil or score > bestScore then
+                bestScore = score
+                bestIndex = index
+            end
+        end
+
+        stance.index = bestIndex
+        stance.misses = 0
+        stance.revision = stance.revision + 1
+    end
+
+    local function finishBurst(burst, now)
+        local stance = burst.stance
+        local weight = 0
+        if burst.head or burst.hit then
+            weight = burst.head and 1.25 or 0.5
+        elseif burst.pending == 0 and burst.resolverMiss then
+            weight = -1
+        end
+
+        local score = recentScore(stance, burst.index, now)
+        local action = "ignored"
+        if weight ~= 0 then
+            local age = math.max(0, now - burst.time)
+            stance.scores[burst.index] = {
+                value = math.max(-3, math.min(3, score + weight * 0.5 ^ (age / 12))),
+                time = now,
+            }
+            if stance.revision ~= burst.revision then
+                action = "past angle scored"
+            elseif weight > 0 then
+                stance.misses = 0
+                action = "kept"
+            else
+                stance.misses = stance.misses + 1
+                if score < 0.9 or stance.misses >= 2 then
+                    selectAlternative(stance, now)
+                    action = "switched"
+                else
+                    action = "kept after earlier hits"
+                end
+            end
+        end
+        local outcomes = {}
+        for i, id in ipairs(burst.ids) do
+            local shot = shots[id]
+            outcomes[i] = shot.outcome or "no result"
+        end
+        lastDecision = string.format("%s | %s | %s | %d -> %d deg | %s",
+            burst.name, burst.pose, table.concat(outcomes, " + "), offsets[burst.index], offsets[stance.index], action)
+        if stance.openBurst == burst then stance.openBurst = nil end
+        for _, id in ipairs(burst.ids) do
+            shots[id] = nil
+        end
+    end
+
+    local function settleBursts(now)
+        if #bursts == 0 then return end
+        local waiting = {}
+        local blocked = {}
+        for _, burst in ipairs(bursts) do
+            local age = now - burst.time
+            local closed = #burst.ids == 2 or age > 0.15
+            if not blocked[burst.stance] and closed and (burst.pending == 0 or age > 2) then
+                finishBurst(burst, now)
+            else
+                blocked[burst.stance] = true
+                waiting[#waiting + 1] = burst
+            end
+        end
+        bursts = waiting
+    end
+
+    local function update()
+        if not enabled:get() then
+            stop()
+            return
+        end
+        active = true
+
+        local now = globals.realtime()
+        settleBursts(now)
+
+        targets = {}
+        targetsByUserId = {}
+        local present = {}
+        for _, enemy in ipairs(entity.get_enemies()) do
+            local key = enemy.UserId or enemy
+            present[key] = true
+
+            local state = players[key]
+            if not state then
+                state = { stances = {} }
+                players[key] = state
+            end
+            state.player = enemy
+
+            local info = entity.get_info(enemy)
+            if info and info.is_alive then
+                local name = info.state or "Stand"
+                local stance = state.stances[name]
+                local delta = measuredDelta(enemy)
+                if not stance then
+                    stance = { index = delta and nearestAngle(delta) or 3, revision = 0, scores = {}, misses = 0,
+                        playerName = tostring(info.name or key), pose = name, baseline = delta }
+                    state.stances[name] = stance
+                end
+
+                if state.lastPose ~= name then stance.candidate = nil end
+                state.lastPose = name
+                if delta then
+                    stance.baseline = stance.baseline or delta
+                    local distance = math.abs((delta - stance.baseline + 180) % 360 - 180)
+                    if distance < 24 then
+                        stance.candidate = nil
+                    elseif not stance.candidate or math.abs((delta - stance.candidate + 180) % 360 - 180) > 12 then
+                        stance.candidate = delta
+                        stance.since = now
+                        stance.samples = 1
+                    else
+                        stance.samples = stance.samples + 1
+                        if stance.samples >= 5 and now - stance.since >= 0.14 then
+                            -- In-flight shots keep their original stance and scoring history.
+                            stance = { index = nearestAngle(delta), revision = stance.revision + 1,
+                                scores = {}, misses = 0, playerName = stance.playerName, pose = name, baseline = delta }
+                            state.stances[name] = stance
+                        end
+                    end
+                else
+                    stance.candidate = nil
+                end
+
+                local applied = { stance = stance, index = stance.index, revision = stance.revision }
+                targets[enemy] = applied
+                targetsByUserId[key] = applied
+                if entity.get_player_slot then
+                    local slot = entity.get_player_slot(enemy)
+                    if slot ~= nil then targets[slot] = applied end
+                end
+
+                if state.originalForce == nil and state.originalOffset == nil then
+                    state.originalForce = plist.get(enemy, "Force body yaw") == true
+                    state.originalOffset = plist.get(enemy, "Override yaw offset") or 0
+                end
+                plist.set(enemy, "Force body yaw", true)
+                plist.set(enemy, "Override yaw offset", offsets[stance.index])
+            else
+                state.lastPose = nil
+                restorePlayer(state)
+            end
+        end
+
+        for key, state in pairs(players) do
+            if not present[key] then
+                if state.player.Parent then restorePlayer(state) end
+                players[key] = nil
+            end
+        end
+    end
+
+    client.set_event_callback("aim_fire", function(event)
+        if type(event) == "table" and event.id ~= nil and shots[event.id] then return end
+        if not active or not enabled:get() or type(event) ~= "table" or event.id == nil then
+            return
+        end
+
+        local applied = targets[event.target] or targetsByUserId[event.target]
+        if not applied and typeof(event.target) == "Instance" then
+            applied = targetsByUserId[event.target.UserId]
+        end
+        if not applied then return end
+
+        local now = globals.realtime()
+        local stance = applied.stance
+        local burst = stance.openBurst
+        if not burst or burst.revision ~= applied.revision or now - burst.time > 0.15 or #burst.ids >= 2 then
+            burst = { stance = stance, index = applied.index, revision = applied.revision,
+                name = stance.playerName, pose = stance.pose, time = now, ids = {}, pending = 0 }
+            bursts[#bursts + 1] = burst
+            stance.openBurst = burst
+        end
+        burst.ids[#burst.ids + 1] = event.id
+        burst.pending = burst.pending + 1
+        shots[event.id] = { burst = burst }
+    end)
+
+    local function scoreShot(event, hit)
+        if not active or not enabled:get() or type(event) ~= "table" or event.id == nil then return end
+        local shot = shots[event.id]
+        if not shot or shot.done then return end
+        shot.done = true
+        local burst = shot.burst
+        burst.pending = burst.pending - 1
+        if hit then
+            shot.outcome = tostring(event.hitbox or "body") .. " hit"
+            burst.hit = true
+            if string.lower(tostring(event.hitbox)) == "head" then burst.head = true end
+        else
+            shot.outcome = tostring(event.reason or "unknown") .. " miss"
+            if event.reason == "resolver" then burst.resolverMiss = true end
+        end
+    end
+
+    client.set_event_callback("aim_hit", function(event)
+        scoreShot(event, true)
+    end)
+
+    client.set_event_callback("aim_miss", function(event)
+        scoreShot(event, false)
+    end)
+
+    return update, stop
+end
+
+local updateAntiAim, stopAntiAim = setupAntiAim(tab:new_section("Anti-Aim", "Left"))
+local updateResolver, stopResolver = setupResolver(tab:new_section("Resolver", "Right"))
+
+-- Compare consecutive local weapon snapshots so manual shots are included.
+local function setupPeekCoach(section)
+    local enabled = section:new_toggle("Peek Coach", true)
+    local previous, armed, stoppedAt
+
+    local function update()
+        local player = entity.get_local_player()
+        if not enabled:get() or not player or not entity.is_alive(player) then
+            previous, armed, stoppedAt = nil, false, nil
+            return
+        end
+        local gun = weapon.get_active(player)
+        if not gun or type(gun.ammo) ~= "number" or not gun.max_ammo or gun.max_ammo <= 0 then
+            previous, armed, stoppedAt = nil, false, nil
+            return
+        end
+
+        local now = globals.realtime()
+        local speed = movement.get_speed(player, false)
+        local moving = speed > 2.5 or (previous and previous.moving and speed > 1.5)
+        local id = gun.id or gun.name
+        if not previous or previous.id ~= id or gun.is_reloading or previous.reloading
+            or gun.ammo > previous.ammo then
+            armed, stoppedAt = moving and not gun.is_reloading, nil
+        else
+            if moving and not previous.moving then armed, stoppedAt = true, nil end
+            if previous.moving and not moving then stoppedAt = now end
+            if stoppedAt and now - stoppedAt > 2 then armed = false end
+            if armed and gun.ammo < previous.ammo then
+                local timing
+                if moving then
+                    timing = string.format("moving %.1f studs/s", speed)
+                elseif stoppedAt then
+                    timing = string.format("%d ms after stop", math.floor((now - stoppedAt) * 1000 + 0.5))
+                end
+                if timing then
+                    local message = tostring(gun.name or id) .. " | " .. timing
+                    if type(previous.inaccuracy) == "number" then
+                        message = message .. string.format(" | inaccuracy %.3f", previous.inaccuracy)
+                    end
+                    notify("Peek Coach", message, 3, false)
+                end
+                armed = false
+            end
+        end
+        previous = { id = id, ammo = gun.ammo, reloading = gun.is_reloading, moving = moving,
+            inaccuracy = weapon.get_inaccuracy(player) }
+    end
+
+    return update
+end
+
+local updatePeekCoach = setupPeekCoach(tab:new_section("Practice", "Right"))
+
+local function setupCosmetics(section)
+    local hat = section:new_toggle("China Hat", false)
+    local wings = section:new_toggle("Wings", false)
+    local hatColor = section:new_colorpicker("Hat color", Color3.fromRGB(255, 255, 255))
+    local wingColor = section:new_colorpicker("Wing color", Color3.fromRGB(220, 225, 255))
+
+    local circle = {}
+    for i = 1, 32 do
+        local angle = (i - 1) * math.pi * 2 / 32
+        circle[i] = Vector3.new(math.cos(angle), 0, math.sin(angle))
+    end
+
+    local outline = {
+        { 0.15, 0.18 }, { 0.72, 0.92 }, { 1.56, 1.40 }, { 2.50, 1.56 },
+        { 3.15, 1.43 }, { 2.72, 0.69 }, { 2.45, 0.75 }, { 2.18, 0.06 },
+        { 1.93, 0.18 }, { 1.63, -0.52 }, { 1.38, -0.30 }, { 1.08, -0.90 },
+        { 0.85, -0.59 }, { 0.56, -0.76 }, { 0.15, 0.18 },
+    }
+    local ribs = { { 3, 14 }, { 4, 12 }, { 5, 10 }, { 6, 8 }, { 3, 9 } }
+
+    local function project(point)
+        local x, y, visible = render.world_to_screen(point)
+        if visible and type(x) == "number" and type(y) == "number" then
+            return { x, y }
+        end
+    end
+
+    local function drawLine(a, b, color, thickness)
+        if a and b then
+            render.line(a[1], a[2], b[1], b[2], color, thickness)
+        end
+    end
+
+    local function getAnchor(player, hitbox, height)
+        local point = entity.get_player_hitbox_position(player, hitbox)
+        if point then return point end
+
+        local root = entity.get_player_position(player)
+        if root then return root + Vector3.new(0, height, 0) end
+        error("no position for " .. hitbox)
+    end
+
+    local function drawHat(player)
+        local color = hatColor:get() or Color3.fromRGB(255, 255, 255)
+        local head = getAnchor(player, "head", 1.5)
+        if not project(head) then return end
+
+        local base = head + Vector3.new(0, 0.65, 0)
+        local top = project(base + Vector3.new(0, 0.80, 0))
+        local brim = {}
+        for i = 1, #circle do
+            brim[i] = project(base + circle[i] * 1.35)
+        end
+        for i = 1, #circle do
+            drawLine(brim[i], brim[i % #circle + 1], color, 2)
+            drawLine(top, brim[i], color, 1)
+        end
+    end
+
+    local function drawWings(player)
+        local color = wingColor:get() or Color3.fromRGB(220, 225, 255)
+        local chest = getAnchor(player, "chest", 0.6)
+        if not project(chest) then return end
+
+        local _, yaw = entity.get_player_angles_deg(player)
+        local angle = math.rad(yaw or 0)
+        local right = Vector3.new(math.cos(angle), 0, -math.sin(angle))
+        local back = Vector3.new(math.sin(angle), 0, math.cos(angle))
+        local flap = 0.42 + math.sin(globals.realtime() * 3.5) * 0.24
+        local spread, sweep = math.cos(flap), math.sin(flap)
+        for side = -1, 1, 2 do
+            local points = {}
+            for i = 1, #outline do
+                local x, y = outline[i][1], outline[i][2]
+                local point = chest + right * (side * x * spread)
+                    + Vector3.new(0, y, 0) + back * (0.65 + x * sweep)
+                points[i] = project(point)
+            end
+            for i = 1, #outline - 1 do
+                drawLine(points[i], points[i + 1], color, 2)
+            end
+            for _, rib in ipairs(ribs) do
+                drawLine(points[rib[1]], points[rib[2]], color, 1)
+            end
+        end
+    end
+
+    local reported = {}
+    local function paintCosmetic(label, enabled, draw, player)
+        if not enabled then
+            reported[label] = nil
+            return
+        end
+        local ok, message = pcall(draw, player)
+        if ok then
+            reported[label] = nil
+        elseif not reported[label] then
+            reported[label] = true
+            warn("[Custom HvH] " .. label .. ": " .. tostring(message))
+        end
+    end
+
+    client.set_event_callback("paint", function()
+        local showHat, showWings = hat:get(), wings:get()
+        if not showHat and not showWings then
+            reported = {}
+            return
+        end
+
+        local player = entity.get_local_player()
+        if not player or not entity.is_alive(player) then return end
+
+        paintCosmetic("China Hat", showHat, drawHat, player)
+        paintCosmetic("Wings", showWings, drawWings, player)
+    end)
+end
+
+setupCosmetics(tab:new_section("Cosmetics", "Left"))
+
+events.on_tick(function(tick)
+    updateAntiAim(tick)
+    updateResolver()
+    updatePeekCoach()
+end)
+
+client.set_event_callback("shutdown", function()
+    stopAntiAim()
+    stopResolver()
+end)
+
+sounds.override_hitsound(hitSoundId, 1, 1)
+sounds.play(hitSoundId, 1, 1)
